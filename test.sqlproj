@@ -1,0 +1,288 @@
+with adult_admissions as (
+    select
+        a.subject_id,
+        a.hadm_id,
+        a.admittime,
+        p.anchor_age
+    from mimiciv_hosp.admissions a
+    join mimiciv_hosp.patients p
+      on a.subject_id = p.subject_id
+    where p.anchor_age >= 18
+)
+
+Step B: antibiotic times
+
+, antibiotic_orders as (
+    select
+        hadm_id,
+        starttime as abx_time
+    from mimiciv_hosp.prescriptions
+    where lower(drug) similar to '%(vancomycin|piperacillin|cefepime|ceftriaxone|meropenem|zosyn|azithromycin|levofloxacin)%'
+)
+
+Step C: culture times
+
+, culture_orders as (
+    select
+        hadm_id,
+        charttime as culture_time
+    from mimiciv_hosp.microbiologyevents
+    where charttime is not null
+)
+
+Step D: suspected infection
+
+, suspected_infection as (
+    select
+        a.hadm_id,
+        min(
+            case
+                when c.culture_time <= ab.abx_time
+                     and ab.abx_time <= c.culture_time + interval '72 hour'
+                then c.culture_time
+                when ab.abx_time < c.culture_time
+                     and c.culture_time <= ab.abx_time + interval '24 hour'
+                then ab.abx_time
+            end
+        ) as suspicion_time
+    from antibiotic_orders ab
+    join culture_orders c
+      on ab.hadm_id = c.hadm_id
+    join adult_admissions a
+      on a.hadm_id = ab.hadm_id
+    where (
+        (c.culture_time <= ab.abx_time and ab.abx_time <= c.culture_time + interval '72 hour')
+        or
+        (ab.abx_time < c.culture_time and c.culture_time <= ab.abx_time + interval '24 hour')
+    )
+    group by a.hadm_id
+)
+Step E: SOFA around infection
+
+, sofa_window as (
+    select
+        s.hadm_id,
+        si.suspicion_time,
+        max(case
+            when s.starttime between si.suspicion_time - interval '48 hour'
+                                and si.suspicion_time + interval '24 hour'
+            then s.sofa_24hours
+        end) as max_sofa_near_infection
+    from mimiciv_derived.sofa s
+    join suspected_infection si
+      on s.hadm_id = si.hadm_id
+    group by s.hadm_id, si.suspicion_time
+)
+
+Step F: final sepsis label
+
+select
+    hadm_id,
+    suspicion_time,
+    max_sofa_near_infection,
+    case
+        when max_sofa_near_infection >= 2 then 1
+        else 0
+    end as sepsis3_flag
+from sofa_window
+where max_sofa_near_infection >= 2;
+spraychan — 8:42 PM
+DROP TABLE IF EXISTS sepsis_repeat_project;
+
+CREATE TABLE sepsis_repeat_project AS
+WITH first_icu AS (
+    SELECT
+        i.subject_id,
+
+message.txt
+5 KB
+﻿
+spraychan
+spray.chan
+ 
+DROP TABLE IF EXISTS sepsis_repeat_project;
+
+CREATE TABLE sepsis_repeat_project AS
+WITH first_icu AS (
+    SELECT
+        i.subject_id,
+        i.hadm_id,
+        i.stay_id,
+        i.intime,
+        i.outtime,
+        ROW_NUMBER() OVER (
+            PARTITION BY i.subject_id
+            ORDER BY i.intime
+        ) AS rn
+    FROM mimiciv_icu.icustays i
+),
+
+adult_icu AS (
+    SELECT
+        f.subject_id,
+        f.hadm_id,
+        f.stay_id,
+        f.intime,
+        f.outtime,
+        p.anchor_age AS age,
+        p.gender,
+        a.deathtime
+    FROM first_icu f
+    JOIN mimiciv_hosp.patients p
+        ON f.subject_id = p.subject_id
+    JOIN mimiciv_hosp.admissions a
+        ON f.hadm_id = a.hadm_id
+    WHERE f.rn = 1
+      AND p.anchor_age >= 18
+      AND f.hadm_id IS NOT NULL
+      AND f.intime IS NOT NULL
+      AND f.outtime IS NOT NULL
+      AND f.outtime >= f.intime + INTERVAL '48 hour'
+),
+
+sepsis_icd AS (
+    SELECT DISTINCT hadm_id
+    FROM mimiciv_hosp.diagnoses_icd
+    WHERE
+        (icd_version = 9 AND (
+            icd_code LIKE '038%' OR
+            icd_code IN ('99591','99592','78552')
+        ))
+        OR
+        (icd_version = 10 AND (
+            icd_code LIKE 'A40%' OR
+            icd_code LIKE 'A41%' OR
+            icd_code IN ('R6520','R6521')
+        ))
+),
+
+high_lactate AS (
+    SELECT DISTINCT
+        l.hadm_id
+    FROM mimiciv_hosp.labevents l
+    WHERE l.itemid = 50813
+      AND l.valuenum >= 2
+),
+
+sepsis_cohort AS (
+    SELECT a.*
+    FROM adult_icu a
+    JOIN sepsis_icd s
+        ON a.hadm_id = s.hadm_id
+    JOIN high_lactate h
+        ON a.hadm_id = h.hadm_id
+),
+
+labs_48h AS (
+    SELECT
+        l.subject_id,
+        l.hadm_id,
+        c.stay_id,
+        l.itemid,
+        l.charttime,
+        l.valuenum
+    FROM mimiciv_hosp.labevents l
+    JOIN sepsis_cohort c
+        ON l.hadm_id = c.hadm_id
+    WHERE l.charttime >= c.intime
+      AND l.charttime <= c.intime + INTERVAL '48 hour'
+      AND l.itemid IN (
+          50813, -- lactate
+          51300, -- WBC
+          50912, -- creatinine
+          51006, -- BUN
+          50983, -- sodium
+          50971, -- potassium
+          50882, -- bicarbonate
+          51222, -- hemoglobin
+          51265, -- platelet count
+          50931  -- glucose
+      )
+      AND l.valuenum IS NOT NULL
+      AND l.charttime IS NOT NULL
+),
+
+ordered_labs AS (
+    SELECT
+        *,
+        LAG(charttime) OVER (
+            PARTITION BY stay_id, itemid
+            ORDER BY charttime
+        ) AS prev_charttime
+    FROM labs_48h
+),
+
+repeat_flags AS (
+    SELECT
+        *,
+        CASE
+            WHEN prev_charttime IS NOT NULL
+             AND charttime <= prev_charttime + INTERVAL '4 hour'
+            THEN 1
+            ELSE 0
+        END AS is_repeat
+    FROM ordered_labs
+),
+
+patient_summary AS (
+    SELECT
+        stay_id,
+        COUNT(*) AS total_labs,
+        SUM(is_repeat) AS repeated_labs,
+        SUM(is_repeat) * 1.0 / COUNT(*) AS redundancy_ratio
+    FROM repeat_flags
+    GROUP BY stay_id
+),
+
+lab_type_summary AS (
+    SELECT
+        stay_id,
+        SUM(CASE WHEN itemid = 50813 THEN 1 ELSE 0 END) AS lactate_n,
+        SUM(CASE WHEN itemid = 51300 THEN 1 ELSE 0 END) AS wbc_n,
+        SUM(CASE WHEN itemid = 50912 THEN 1 ELSE 0 END) AS creatinine_n,
+        SUM(CASE WHEN itemid = 51006 THEN 1 ELSE 0 END) AS bun_n,
+        SUM(CASE WHEN itemid = 50983 THEN 1 ELSE 0 END) AS sodium_n,
+        SUM(CASE WHEN itemid = 50971 THEN 1 ELSE 0 END) AS potassium_n,
+        SUM(CASE WHEN itemid = 50882 THEN 1 ELSE 0 END) AS bicarbonate_n,
+        SUM(CASE WHEN itemid = 51222 THEN 1 ELSE 0 END) AS hemoglobin_n,
+        SUM(CASE WHEN itemid = 51265 THEN 1 ELSE 0 END) AS platelets_n,
+        SUM(CASE WHEN itemid = 50931 THEN 1 ELSE 0 END) AS glucose_n
+    FROM repeat_flags
+    GROUP BY stay_id
+)
+
+SELECT
+    c.subject_id,
+    c.hadm_id,
+    c.stay_id,
+    c.intime,
+    c.outtime,
+    c.age,
+    c.gender,
+    c.deathtime,
+    CASE
+        WHEN c.deathtime IS NOT NULL THEN 1
+        ELSE 0
+    END AS mortality,
+    p.total_labs,
+    p.repeated_labs,
+    p.redundancy_ratio,
+    l.lactate_n,
+    l.wbc_n,
+    l.creatinine_n,
+    l.bun_n,
+    l.sodium_n,
+    l.potassium_n,
+    l.bicarbonate_n,
+    l.hemoglobin_n,
+    l.platelets_n,
+    l.glucose_n
+FROM sepsis_cohort c
+JOIN patient_summary p
+    ON c.stay_id = p.stay_id
+JOIN lab_type_summary l
+    ON c.stay_id = l.stay_id;
+
+
+
+

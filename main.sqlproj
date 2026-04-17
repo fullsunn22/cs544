@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build">
+  <Sdk Name="Microsoft.Build.Sql" Version="2.1.0" />
+  <PropertyGroup>
+    <Name>cs544</Name>
+    <ProjectGuid>{DA43A88C-960C-4789-A63B-00B05B03A064}</ProjectGuid>
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql170DatabaseSchemaProvider</DSP>
+    <ModelCollation>1033, CI</ModelCollation>
+  </PropertyGroup>
+  <Target Name="BeforeBuild">
+    <Delete Files="$(BaseIntermediateOutputPath)\project.assets.json" />
+  </Target>
+</Project>
+
+
+
+/* icu stay & 18<= years of age & 48hr */
+WITH first_icu AS (
+    SELECT
+        i.subject_id,
+        i.hadm_id,
+        i.stay_id,
+        i.intime,
+        i.outtime,
+        ROW_NUMBER() OVER (PARTITION BY i.subject_id ORDER BY i.intime) AS rn
+    FROM mimiciv_icu.icustays i
+),
+
+adult_icu AS (
+    SELECT
+        f.*,
+        p.anchor_age,
+        p.gender,
+        a.deathtime
+    FROM first_icu f
+    JOIN mimiciv_hosp.patients p
+        ON f.subject_id = p.subject_id
+    JOIN mimiciv_hosp.admissions a
+        ON f.hadm_id = a.hadm_id
+    WHERE f.rn = 1
+      AND p.anchor_age >= 18
+      AND f.outtime >= f.intime + INTERVAL '48 hour'
+)
+
+/* icd-based sepsis */
+, sepsis_icd AS (
+    SELECT DISTINCT hadm_id
+    FROM mimiciv_hosp.diagnoses_icd
+    WHERE
+        (icd_version = 9 AND (
+            icd_code LIKE '038%' OR
+            icd_code IN ('99591','99592','78552')
+        ))
+        OR
+        (icd_version = 10 AND (
+            icd_code LIKE 'A40%' OR
+            icd_code LIKE 'A41%' OR
+            icd_code IN ('R6520','R6521')
+        ))
+)
+
+/* elevated lactate (≥2 mmol/L) */
+, high_lactate AS (
+    SELECT DISTINCT l.hadm_id
+    FROM mimiciv_hosp.labevents l
+    WHERE
+        l.itemid = 50813  -- lactate
+        AND l.valuenum >= 2
+)
+
+/* refined sepsis cohort (ICD + lactate) */
+, sepsis_cohort AS (
+    SELECT a.*
+    FROM adult_icu a
+    JOIN sepsis_icd s
+        ON a.hadm_id = s.hadm_id
+    JOIN high_lactate h
+        ON a.hadm_id = h.hadm_id
+)
+
+/* extract labs (first 48hr) */
+, labs AS (
+    SELECT
+        l.subject_id,
+        l.hadm_id,
+        c.stay_id,
+        l.itemid,
+        l.charttime,
+        l.valuenum
+    FROM mimiciv_hosp.labevents l
+    JOIN sepsis_cohort c
+        ON l.hadm_id = c.hadm_id
+    WHERE
+        l.charttime >= c.intime
+        AND l.charttime <= c.intime + INTERVAL '48 hour'
+        AND l.itemid IN (
+            50813, -- lactate
+            51300, -- WBC
+            50912, -- creatinine
+            51006, -- BUN
+            50983, -- sodium
+            50971, -- potassium
+            50882, -- bicarbonate
+            51222, -- hemoglobin
+            51265, -- platelets
+            50931  -- glucose
+        )
+        AND l.valuenum IS NOT NULL
+)
+
+/* order labs & compute time difference */
+, ordered_labs AS (
+    SELECT
+        *,
+        LAG(charttime) OVER (
+            PARTITION BY stay_id, itemid
+            ORDER BY charttime
+        ) AS prev_time
+    FROM labs
+)
+
+/* flag repeated labs (=<4hr) */
+, repeat_flags AS (
+    SELECT
+        *,
+        CASE
+            WHEN prev_time IS NOT NULL
+             AND charttime <= prev_time + INTERVAL '4 hour'
+            THEN 1
+            ELSE 0
+        END AS is_repeat
+    FROM ordered_labs
+)
+
+/* patient level summary */
+, patient_summary AS (
+    SELECT
+        stay_id,
+        COUNT(*) AS total_labs,
+        SUM(is_repeat) AS repeated_labs,
+        SUM(is_repeat) * 1.0 / COUNT(*) AS redundancy_ratio
+    FROM repeat_flags
+    GROUP BY stay_id
+)
+
+SELECT
+    c.subject_id,
+    c.hadm_id,
+    c.stay_id,
+    c.age,
+    c.gender,
+    c.deathtime,
+    p.total_labs,
+    p.repeated_labs,
+    p.redundancy_ratio
+FROM sepsis_cohort c
+JOIN patient_summary p
+    ON c.stay_id = p.stay_id;
+
+df["mortality"] = df["deathtime"].notnull()
+df["quartile"] = pd.qcut(df["redundancy_ratio"], 4)
+df.groupby("quartile")["mortality"].mean()
+
+/* regression */
+import statsmodels.api as sm
+
+X = df[["redundancy_ratio", "age"]]
+X = sm.add_constant(X)
+y = df["mortality"]
+
+model = sm.Logit(y, X).fit()
+print(model.summary())
